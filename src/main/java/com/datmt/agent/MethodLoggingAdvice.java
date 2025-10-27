@@ -1,8 +1,8 @@
 package com.datmt.agent;
 
-
 import com.google.gson.Gson;
 import net.bytebuddy.asm.Advice;
+import net.bytebuddy.implementation.bytecode.assign.Assigner;
 
 import java.io.BufferedWriter;
 import java.io.FileWriter;
@@ -28,7 +28,7 @@ public class MethodLoggingAdvice {
     public static final Gson gson = new Gson();
 
     // The file to write to. This will be set by the agent.
-    public static String LOG_FILE = "method_calls.json"; // Default value
+    public static String LOG_FILE = "method_calls.jsonl"; // Default value
 
     /**
      * Initializes the advice class with agent arguments.
@@ -60,7 +60,12 @@ public class MethodLoggingAdvice {
             @Advice.AllArguments Object[] args
     ) {
         // Push the start time onto the stack for this thread
-        startTimeStack.get().push(System.nanoTime());
+        try {
+            startTimeStack.get().push(System.nanoTime());
+        } catch (Exception e) {
+            // Safety catch
+            System.err.println("[MethodLoggerAgent] Error in onEnter: " + e.getMessage());
+        }
     }
 
     /**
@@ -76,78 +81,100 @@ public class MethodLoggingAdvice {
     public static void onExit(
             @Advice.Origin java.lang.reflect.Method method,
             @Advice.AllArguments Object[] args,
-            @Advice.Return Object returned,
+            @Advice.Return(typing = Assigner.Typing.DYNAMIC) Object returned, // <-- THE CORRECT FIX IS HERE
             @Advice.Thrown Throwable thrown
     ) {
-        // Pop the start time from the stack
-        Deque<Long> stack = startTimeStack.get();
-        Long startTime = stack.poll(); // poll() returns null if empty, pop() throws exception
+        try {
+            // Pop the start time from the stack
+            Deque<Long> stack = startTimeStack.get();
+            Long startTime = stack.poll(); // poll() returns null if empty, pop() throws exception
 
-        long durationNanos = 0;
-        if (startTime != null) {
-            durationNanos = System.nanoTime() - startTime;
-        } else {
-            // This case should ideally not happen if onEnter/onExit are paired correctly
-            // But it's good practice to be safe.
-        }
+            long durationNanos = 0;
+            if (startTime != null) {
+                durationNanos = System.nanoTime() - startTime;
+            }
 
-        if (stack.isEmpty()) {
-            // Clean up the ThreadLocal for this thread if the stack is empty
-            startTimeStack.remove();
-        }
+            if (stack.isEmpty()) {
+                // Clean up the ThreadLocal for this thread if the stack is empty
+                startTimeStack.remove();
+            }
 
+            // 1. Collect parameter names and values
+            Map<String, Object> params = new HashMap<>();
+            Parameter[] parameters = method.getParameters();
+            for (int i = 0; i < parameters.length; i++) {
+                String paramName = parameters[i].getName(); // Can still be "arg0", "arg1" if -parameters flag not set
+                Object paramValue = (i < args.length) ? args[i] : null;
+                // Use safe serialization
+                params.put(paramName, safeSerialize(paramValue));
+            }
 
-        // 1. Collect parameter names and values
-        Map<String, String> params = new HashMap<>();
-        Parameter[] parameters = method.getParameters();
-        for (int i = 0; i < parameters.length; i++) {
-            String paramName = parameters[i].getName();
-            String paramValue = "N/A";
-            if (args[i] != null) {
-                try {
-                    // Use Gson to serialize even complex objects to a string.
-                    // Be careful with objects that have circular references!
-                    paramValue = gson.toJson(args[i]);
-                } catch (Exception e) {
-                    paramValue = "Error serializing: " + e.getMessage();
-                }
+            // 2. Determine return type and value
+            String returnType = method.getReturnType().getName();
+            Object returnValue;
+
+            if (thrown != null) {
+                returnType = "EXCEPTION";
+                returnValue = thrown;
             } else {
-                paramValue = "null";
+                returnValue = returned;
             }
-            params.put(paramName, paramValue);
+
+            // 3. Create the data object to be logged
+            Map<String, Object> logEntry = new HashMap<>();
+            logEntry.put("time", Instant.now().toString());
+
+            // Safely get the package name to avoid NPE for default package
+            Package pkg = method.getDeclaringClass().getPackage();
+            logEntry.put("package", (pkg != null) ? pkg.getName() : "default");
+
+            logEntry.put("class", method.getDeclaringClass().getSimpleName());
+            logEntry.put("method", method.getName());
+            logEntry.put("params", params);
+            logEntry.put("returnType", returnType);
+            // Use safe serialization for the return value
+            logEntry.put("returnData", safeSerialize(returnValue));
+            logEntry.put("durationNanos", durationNanos);
+
+            // 4. Serialize to JSON and write to file
+            String jsonLog = gson.toJson(logEntry);
+            writeLog(jsonLog);
+
+        } catch (Exception e) {
+            // Catch all exceptions in advice code to prevent crashing the target app
+            System.err.println("[MethodLoggerAgent] Error in onExit: " + e.getMessage());
+            e.printStackTrace(System.err);
         }
+    }
 
-        // 2. Determine return type and value
-        String returnType = method.getReturnType().getName();
-        String returnValue = "N/A";
-
-        if (thrown != null) {
-            returnType = "EXCEPTION";
-            returnValue = thrown.toString();
-        } else if (returned != null) {
+    /**
+     * Safely serializes an object to a String for JSON logging.
+     * It tries to use Gson, but falls back to a sanitized toString()
+     * if serialization fails (e.g., on internal JDK classes).
+     *
+     * @param obj The object to serialize.
+     * @return A String (for primitive) or JSON String representation.
+     */
+    public static Object safeSerialize(Object obj) {
+        if (obj == null) {
+            return "null";
+        }
+        try {
+            // Check for common simple types that Gson handles well
+            if (obj instanceof String || obj instanceof Number || obj instanceof Boolean) {
+                return obj;
+            }
+            // Try to serialize with Gson
+            return gson.toJson(obj);
+        } catch (Throwable t) {
+            // If serialization fails (e.g., circular reference, inaccessible fields)
+            // fall back to a simple toString().
             try {
-                returnValue = gson.toJson(returned);
-            } catch (Exception e) {
-                returnValue = "Error serializing return: " + e.getMessage();
+                return obj.toString();
+            } catch (Throwable t2) {
+                return "Error in toString(): " + t2.getMessage();
             }
-        } else if (!returnType.equals("void")) {
-            returnValue = "null";
         }
-
-        // 3. Create the data object to be logged
-        Map<String, Object> logEntry = new HashMap<>();
-        logEntry.put("time", Instant.now().toString());
-        logEntry.put("package", method.getDeclaringClass().getPackage().getName());
-        logEntry.put("class", method.getDeclaringClass().getSimpleName());
-        logEntry.put("method", method.getName());
-        logEntry.put("params", params);
-        logEntry.put("returnType", returnType);
-        logEntry.put("returnData", returnValue);
-        logEntry.put("durationNanos", durationNanos);
-
-        // 4. Serialize to JSON and write to file
-        String jsonLog = gson.toJson(logEntry);
-        writeLog(jsonLog);
     }
 
     /**

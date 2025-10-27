@@ -12,9 +12,9 @@ repositories {
 
 dependencies {
     // Byte Buddy is the core library for bytecode instrumentation
-    implementation 'net.bytebuddy:byte-buddy:1.14.9'
-    implementation 'net.bytebuddy:byte-buddy-agent:1.14.9'
-
+//    implementation 'net.bytebuddy:byte-buddy:1.17.5'
+//    implementation 'net.bytebuddy:byte-buddy-agent:1.17.5'
+    implementation 'net.bytebuddy:byte-buddy-dep:1.17.5'
     // Gson is a simple library to convert Java objects to JSON
     implementation 'com.google.code.gson:gson:2.10.1'
 
