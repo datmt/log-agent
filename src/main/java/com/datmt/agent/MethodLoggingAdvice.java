@@ -135,6 +135,7 @@ public class MethodLoggingAdvice {
             // Use safe serialization for the return value
             logEntry.put("returnData", safeSerialize(returnValue));
             logEntry.put("durationNanos", durationNanos);
+            logEntry.put("thread", Thread.currentThread().getName());
 
             // 4. Serialize to JSON and write to file
             String jsonLog = gson.toJson(logEntry);
