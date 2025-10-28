@@ -78,18 +78,18 @@ public class MethodLoggerAgent {
                         .and(ElementMatchers.not(excludeMatcher)) // <-- New exclusion logic
 
                         // --- Default Exclusions for stability ---
-                        .and(ElementMatchers.not(ElementMatchers.nameStartsWith("com.example.agent")))
+                        .and(ElementMatchers.not(ElementMatchers.nameStartsWith("com.datmt.agent")))
                         .and(ElementMatchers.not(ElementMatchers.nameStartsWith("net.bytebuddy")))
                         .and(ElementMatchers.not(ElementMatchers.nameStartsWith("java.")))
                         .and(ElementMatchers.not(ElementMatchers.nameStartsWith("javax.")))
                         .and(ElementMatchers.not(ElementMatchers.nameStartsWith("sun.")))
+                        .and(ElementMatchers.not(ElementMatchers.nameStartsWith("jdk.")))
                         .and(ElementMatchers.not(ElementMatchers.nameStartsWith("com.sun.")))
                         .and(ElementMatchers.not(ElementMatchers.nameStartsWith("com.google.gson")))
 
                         // --- CRITICAL SPRING FIX ---
                         // Exclude all CGLIB proxy classes. This is more robust.
-                        .and(ElementMatchers.not(ElementMatchers.nameContains("CGLIB")))
-                        .and(ElementMatchers.not(ElementMatchers.nameContains("$$")))
+                        .and(ElementMatchers.not(ElementMatchers.nameMatches(".*\\$\\$.*")))
                 )
                 .transform((builder, typeDescription, classLoader, module, transformer) ->
                         builder.method(ElementMatchers.any()) // Transform all methods in the matched classes
