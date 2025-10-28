@@ -14,10 +14,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.Map;
+import java.util.*;
 
 /**
  * This class contains the "advice" logic that will be woven into the target methods.
@@ -34,6 +31,7 @@ public class MethodLoggingAdvice {
 
     // The path to the log file, set by the agent premain
     public static Path LOG_FILE = Paths.get("method_calls.jsonl");
+    public static Integer callerDepth = 1;
 
     /**
      * Initializes the logger with the specified log file path.
@@ -41,8 +39,9 @@ public class MethodLoggingAdvice {
      *
      * @param logFile The path to the log file.
      */
-    public static void init(String logFile) {
+    public static void init(String logFile, int cd) {
         LOG_FILE = Paths.get(logFile);
+        callerDepth = cd;
     }
 
     /**
@@ -68,10 +67,10 @@ public class MethodLoggingAdvice {
      * This method is executed "on method exit" (after the original method's code).
      * It logs everything to the JSON file.
      *
-     * @param method    The method that was executed.
-     * @param allArgs   All arguments passed to the method.
-     * @param returned  The value returned by the method.
-     * @param thrown    The exception thrown by the method, if any.
+     * @param method   The method that was executed.
+     * @param allArgs  All arguments passed to the method.
+     * @param returned The value returned by the method.
+     * @param thrown   The exception thrown by the method, if any.
      */
     @Advice.OnMethodExit(onThrowable = Throwable.class)
     public static void onExit(
@@ -84,12 +83,12 @@ public class MethodLoggingAdvice {
         long durationNanos = 0;
 
         // 2. Get the accurate caller by walking the stack trace
-        String caller = getCallerMethod();
+        String callers = getCallerMethods(callerDepth);
 
         // 3. Build the log entry
         Map<String, Object> logEntry = new HashMap<>();
         logEntry.put("time", Instant.now().toString());
-        logEntry.put("caller", caller);
+        logEntry.put("callers", callers);
 
         // Check for null package (e.g., default package)
         Package pkg = method.getDeclaringClass().getPackage();
@@ -130,27 +129,50 @@ public class MethodLoggingAdvice {
      *
      * @return The fully-qualified name of the caller method.
      */
-    public static String getCallerMethod() {
-        StackTraceElement[] stack = new Throwable().getStackTrace();
+    public static String getCallerMethods(int callerDepth) {
+        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
         String agentClassName = MethodLoggingAdvice.class.getName();
+        List<String> callers = new ArrayList<>();
 
-        // Walk the stack to find the *first* method *outside* of our agent
-        for (int i = 1; i < stack.length; i++) {
-            StackTraceElement frame = stack[i];
-            // 1. Skip all frames from our own advice class
-            if (!frame.getClassName().equals(agentClassName)) {
-                // 2. The first frame *after* our agent is the instrumented method.
-                //    The frame *after that* is the actual caller.
-                int callerIndex = i + 1;
-                if (callerIndex < stack.length) {
-                    StackTraceElement callerFrame = stack[callerIndex];
-                    return callerFrame.getClassName() + "." + callerFrame.getMethodName();
-                }
-                // If there is no frame after, the instrumented method was the entry point
-                return "ENTRYPOINT_OF_THREAD";
+        boolean foundInstrumentedMethod = false;
+
+        // Walk the stack to collect callers
+        for (StackTraceElement frame : stack) {
+            String className = frame.getClassName();
+
+            // Skip the agent's advice class frames
+            if (className.equals(agentClassName)) {
+                continue;
+            }
+
+            // Skip Thread.getStackTrace() and this method itself
+            if (className.equals(Thread.class.getName()) ||
+                    frame.getMethodName().equals("getCallerMethod")) {
+                continue;
+            }
+
+            if (!foundInstrumentedMethod) {
+                // First non-agent frame is the instrumented method itself - skip it
+                foundInstrumentedMethod = true;
+                continue;
+            }
+
+            // Now we're collecting actual callers
+            String caller = className + "." + frame.getMethodName() +
+                    ":" + frame.getLineNumber();
+            callers.add(caller);
+
+            // Stop when we have enough callers
+            if (callers.size() >= callerDepth) {
+                break;
             }
         }
-        return "UNKNOWN_CALLER";
+
+        if (callers.isEmpty()) {
+            return "ENTRYPOINT_OF_THREAD";
+        }
+
+        return String.join(" <- ", callers);
     }
 
 

@@ -31,13 +31,14 @@ public class MethodLoggerAgent {
             String logFile = argsMap.getOrDefault("logfile", "method_calls.jsonl");
             String packages = argsMap.getOrDefault("packages", null);
             String excludePackages = argsMap.getOrDefault("excludePackages", null);
+            Integer callerDepth = Helpers.fromString(argsMap.getOrDefault("callerDepth", "1"), 1);
             String logLevel = argsMap.getOrDefault("logLevel", "ALL"); // ALL, PUBLIC, PUBLIC_PROTECTED
 
             // Validate log file path
             validateLogFilePath(logFile);
 
             // Initialize the advice class with the log file path (must be done before any instrumentation)
-            MethodLoggingAdvice.init(logFile);
+            MethodLoggingAdvice.init(logFile, callerDepth);
             System.out.println("[MethodLoggerAgent] Logging to: " + MethodLoggingAdvice.getLogFile());
             System.out.println("[MethodLoggerAgent] Log level: " + logLevel);
 
@@ -165,8 +166,7 @@ public class MethodLoggerAgent {
 
         } catch (Exception e) {
             System.err.println("[MethodLoggerAgent] FATAL: Failed to initialize agent: " + e.getMessage());
-            e.printStackTrace();
-            // Optionally: System.exit(1); // Fail fast if agent is critical
+            System.exit(1); // Fail fast if agent is critical
         }
     }
 
