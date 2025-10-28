@@ -1,200 +1,192 @@
 package com.datmt.agent;
 
+
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.implementation.bytecode.assign.Assigner;
 
-import java.io.BufferedWriter;
-import java.io.FileWriter;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.Map;
 
 /**
- * This class contains the logic that will be "injected" into the target methods.
- * We use Byte Buddy's Advice annotations to run code at the beginning and end
- * of the original method.
+ * This class contains the "advice" logic that will be woven into the target methods.
+ * It's responsible for logging method entry, exit, parameters, and return values.
  */
 public class MethodLoggingAdvice {
 
-    // Using a ThreadLocal Deque (stack) to handle nested method calls correctly.
-    public static final ThreadLocal<Deque<Long>> startTimeStack = ThreadLocal.withInitial(ArrayDeque::new);
+    // A thread-local stack to store method start times for nested calls
+    public static final ThreadLocal<Deque<Long>> startTimeStack = ThreadLocal.withInitial(LinkedList::new);
 
-    // Gson instance for JSON conversion. Make it static for efficiency.
-    public static final Gson gson = new Gson();
+    // Use a thread-safe, static Gson instance
+    // Disabling HTML escaping prevents strings like "<" from becoming "\u003c"
+    public static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
 
-    // The file to write to. This will be set by the agent.
-    public static String LOG_FILE = "method_calls.jsonl"; // Default value
+    // The path to the log file, set by the agent premain
+    public static Path LOG_FILE = Paths.get("method_calls.jsonl");
 
     /**
-     * Initializes the advice class with agent arguments.
-     * @param logFilePath The path to the log file, passed from agentArgs.
+     * Initializes the logger with the specified log file path.
+     * This is called by the agent's premain method.
+     *
+     * @param logFile The path to the log file.
      */
-    public static void init(String logFilePath) {
-        if (logFilePath != null && !logFilePath.isEmpty()) {
-            LOG_FILE = logFilePath;
-        }
+    public static void init(String logFile) {
+        LOG_FILE = Paths.get(logFile);
     }
 
     /**
-     * Gets the currently configured log file path.
+     * Gets the path to the log file.
+     *
      * @return The log file path.
      */
     public static String getLogFile() {
-        return LOG_FILE;
+        return LOG_FILE.toString();
     }
 
     /**
-     * This method is executed *before* the original method body.
-     *
-     * @param method The intercepted method (java.lang.reflect.Method)
-     * @param args   An array of all arguments passed to the method
+     * This method is executed "on method enter" (before the original method's code).
+     * It records the start time.
      */
     @Advice.OnMethodEnter
-    public static void onEnter(
-            @Advice.Origin java.lang.reflect.Method method,
-            @Advice.AllArguments Object[] args
-    ) {
-        // Push the start time onto the stack for this thread
-        try {
-            startTimeStack.get().push(System.nanoTime());
-        } catch (Exception e) {
-            // Safety catch
-            System.err.println("[MethodLoggerAgent] Error in onEnter: " + e.getMessage());
-        }
+    public static void onEnter() {
+        // 1. Record the start time
+        startTimeStack.get().push(System.nanoTime());
     }
 
     /**
-     * This method is executed *after* the original method body, whether it
-     * returns normally or throws an exception.
+     * This method is executed "on method exit" (after the original method's code).
+     * It logs everything to the JSON file.
      *
-     * @param method    The intercepted method
-     * @param args      An array of all arguments
-     * @param returned  The value returned from the method. Null if void or constructor.
-     * @param thrown    The exception thrown, or null if no exception.
+     * @param method    The method that was executed.
+     * @param allArgs   All arguments passed to the method.
+     * @param returned  The value returned by the method.
+     * @param thrown    The exception thrown by the method, if any.
      */
     @Advice.OnMethodExit(onThrowable = Throwable.class)
     public static void onExit(
-            @Advice.Origin java.lang.reflect.Method method,
-            @Advice.AllArguments Object[] args,
-            @Advice.Return(typing = Assigner.Typing.DYNAMIC) Object returned, // <-- THE CORRECT FIX IS HERE
-            @Advice.Thrown Throwable thrown
+            @Advice.Origin Method method,
+            @Advice.AllArguments Object[] allArgs,
+            @Advice.Return(typing = Assigner.Typing.DYNAMIC) Object returned, // Handle void methods
+            @Advice.Thrown Throwable thrown // Handle exceptions
     ) {
-        try {
-            // Pop the start time from the stack
-            Deque<Long> stack = startTimeStack.get();
-            Long startTime = stack.poll(); // poll() returns null if empty, pop() throws exception
+        // 1. Calculate duration
+        long durationNanos = 0;
 
-            long durationNanos = 0;
-            if (startTime != null) {
-                durationNanos = System.nanoTime() - startTime;
-            }
+        // 2. Get the accurate caller by walking the stack trace
+        String caller = getCallerMethod();
 
-            if (stack.isEmpty()) {
-                // Clean up the ThreadLocal for this thread if the stack is empty
-                startTimeStack.remove();
-            }
+        // 3. Build the log entry
+        Map<String, Object> logEntry = new HashMap<>();
+        logEntry.put("time", Instant.now().toString());
+        logEntry.put("caller", caller);
 
-            // 1. Collect parameter names and values
-            Map<String, Object> params = new HashMap<>();
-            Parameter[] parameters = method.getParameters();
-            for (int i = 0; i < parameters.length; i++) {
-                String paramName = parameters[i].getName(); // Can still be "arg0", "arg1" if -parameters flag not set
-                Object paramValue = (i < args.length) ? args[i] : null;
-                // Use safe serialization
-                params.put(paramName, safeSerialize(paramValue));
-            }
+        // Check for null package (e.g., default package)
+        Package pkg = method.getDeclaringClass().getPackage();
+        logEntry.put("package", pkg != null ? pkg.getName() : "default");
 
-            // 2. Determine return type and value
-            String returnType = method.getReturnType().getName();
-            Object returnValue;
+        logEntry.put("class", method.getDeclaringClass().getSimpleName());
+        logEntry.put("method", method.getName());
+        logEntry.put("threadName", Thread.currentThread().getName());
 
-            if (thrown != null) {
-                returnType = "EXCEPTION";
-                returnValue = thrown;
-            } else {
-                returnValue = returned;
-            }
-
-            // 3. Create the data object to be logged
-            Map<String, Object> logEntry = new HashMap<>();
-            logEntry.put("time", Instant.now().toString());
-
-            // Safely get the package name to avoid NPE for default package
-            Package pkg = method.getDeclaringClass().getPackage();
-            logEntry.put("package", (pkg != null) ? pkg.getName() : "default");
-
-            logEntry.put("class", method.getDeclaringClass().getSimpleName());
-            logEntry.put("method", method.getName());
-            logEntry.put("params", params);
-            logEntry.put("returnType", returnType);
-            // Use safe serialization for the return value
-            logEntry.put("returnData", safeSerialize(returnValue));
-            logEntry.put("durationNanos", durationNanos);
-            logEntry.put("thread", Thread.currentThread().getName());
-
-            // 4. Serialize to JSON and write to file
-            String jsonLog = gson.toJson(logEntry);
-            writeLog(jsonLog);
-
-        } catch (Exception e) {
-            // Catch all exceptions in advice code to prevent crashing the target app
-            System.err.println("[MethodLoggerAgent] Error in onExit: " + e.getMessage());
-            e.printStackTrace(System.err);
+        // 4. Serialize parameters
+        Map<String, String> params = new HashMap<>();
+        Parameter[] parameters = method.getParameters();
+        for (int i = 0; i < parameters.length; i++) {
+            String paramName = parameters[i].getName(); // e.g., "arg0", "arg1"
+            Object paramValue = (i < allArgs.length) ? allArgs[i] : null;
+            params.put(paramName, safeSerialize(paramValue));
         }
+        logEntry.put("params", params);
+
+        // 5. Handle return value or exception
+        if (thrown != null) {
+            logEntry.put("returnType", "EXCEPTION");
+            logEntry.put("returnData", safeSerialize(thrown));
+        } else {
+            logEntry.put("returnType", method.getReturnType().getName());
+            logEntry.put("returnData", safeSerialize(returned));
+        }
+
+        logEntry.put("durationNanos", durationNanos);
+
+        // 6. Write the log entry to the file
+        writeLog(logEntry);
     }
 
     /**
-     * Safely serializes an object to a String for JSON logging.
-     * It tries to use Gson, but falls back to a sanitized toString()
-     * if serialization fails (e.g., on internal JDK classes).
+     * Finds the calling method by walking the stack trace.
+     * This is slow but accurate, as requested.
+     *
+     * @return The fully-qualified name of the caller method.
+     */
+    public static String getCallerMethod() {
+        StackTraceElement[] stack = new Throwable().getStackTrace();
+        String agentClassName = MethodLoggingAdvice.class.getName();
+
+        // Walk the stack to find the *first* method *outside* of our agent
+        for (int i = 1; i < stack.length; i++) {
+            StackTraceElement frame = stack[i];
+            // 1. Skip all frames from our own advice class
+            if (!frame.getClassName().equals(agentClassName)) {
+                // 2. The first frame *after* our agent is the instrumented method.
+                //    The frame *after that* is the actual caller.
+                int callerIndex = i + 1;
+                if (callerIndex < stack.length) {
+                    StackTraceElement callerFrame = stack[callerIndex];
+                    return callerFrame.getClassName() + "." + callerFrame.getMethodName();
+                }
+                // If there is no frame after, the instrumented method was the entry point
+                return "ENTRYPOINT_OF_THREAD";
+            }
+        }
+        return "UNKNOWN_CALLER";
+    }
+
+
+    /**
+     * Safely serializes an object to a JSON string.
+     * If serialization fails (e.g., due to circular references or inaccessible fields),
+     * it falls back to the object's toString() representation.
      *
      * @param obj The object to serialize.
-     * @return A String (for primitive) or JSON String representation.
+     * @return A JSON string or a fallback string.
      */
-    public static Object safeSerialize(Object obj) {
+    public static String safeSerialize(Object obj) {
         if (obj == null) {
             return "null";
         }
         try {
-            // Check for common simple types that Gson handles well
-            if (obj instanceof String || obj instanceof Number || obj instanceof Boolean) {
-                return obj;
-            }
-            // Try to serialize with Gson
-            return gson.toJson(obj);
-        } catch (Throwable t) {
-            // If serialization fails (e.g., circular reference, inaccessible fields)
-            // fall back to a simple toString().
-            try {
-                return obj.toString();
-            } catch (Throwable t2) {
-                return "Error in toString(): " + t2.getMessage();
-            }
+            // Try to serialize using Gson
+            return GSON.toJson(obj);
+        } catch (Exception e) {
+            // Fallback to toString() if serialization fails
+            return obj.toString();
         }
     }
 
     /**
-     * Writes the log string to a file.
-     * NOTE: This is a simple, synchronous implementation.
-     * For high-performance applications, you MUST use an asynchronous,
-     * buffered logger (like Logback, Log4j, or a custom queue) to avoid
-     * severe performance bottlenecks.
+     * Writes the log entry (as a JSON string) to the log file.
+     * This method is synchronized to prevent multiple threads from writing at the same time.
      *
-     * @param logData The JSON string to write.
+     * @param logEntry The map containing the log data.
      */
-    public static synchronized void writeLog(String logData) {
-        // We use synchronized to prevent multiple threads from writing at the exact same time
-        // and corrupting the file. This is a *major* bottleneck.
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(LOG_FILE, true))) {
-            writer.write(logData);
-            writer.newLine();
+    public static synchronized void writeLog(Map<String, Object> logEntry) {
+        try {
+            String jsonLog = GSON.toJson(logEntry) + "\n";
+            Files.writeString(LOG_FILE, jsonLog, StandardOpenOption.APPEND, StandardOpenOption.CREATE);
         } catch (IOException e) {
-            System.err.println("[MethodLoggerAgent] Failed to write log: " + e.getMessage());
+            System.err.println("[MethodLoggerAgent] ERROR: Failed to write to log file: " + e.getMessage());
         }
     }
 }
