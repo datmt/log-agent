@@ -26,14 +26,14 @@ public class MethodLoggingAdvice {
     /**
      * Context information for tracking method calls in a hierarchy.
      */
-    static class CallContext {
-        final String callId;
-        final String parentCallId;
-        final int depth;
-        final long startTimeNanos;
-        final long threadId;
+    public static class CallContext {
+        public final String callId;
+        public final String parentCallId;
+        public final int depth;
+        public final long startTimeNanos;
+        public final long threadId;
 
-        CallContext(String callId, String parentCallId, int depth, long startTimeNanos) {
+        public CallContext(String callId, String parentCallId, int depth, long startTimeNanos) {
             this.callId = callId;
             this.parentCallId = parentCallId;
             this.depth = depth;
@@ -57,16 +57,16 @@ public class MethodLoggingAdvice {
     public static Path HTML_FILE = Paths.get("method_calls.html");
 
     // Sequential call ID generator
-    private static final AtomicLong callIdGenerator = new AtomicLong(0);
+    public static final AtomicLong callIdGenerator = new AtomicLong(0);
 
     // Flag to track if HTML file has been initialized
-    private static volatile boolean htmlInitialized = false;
+    public static volatile boolean htmlInitialized = false;
 
     // Lock for HTML file initialization
-    private static final Object htmlInitLock = new Object();
+    public static final Object htmlInitLock = new Object();
 
     // Lock for HTML file writing
-    private static final Object htmlWriteLock = new Object();
+    public static final Object htmlWriteLock = new Object();
 
     /**
      * Initializes the logger with the specified log file path and HTML file path.
@@ -80,11 +80,6 @@ public class MethodLoggingAdvice {
         LOG_FILE = Paths.get(logFile);
         HTML_FILE = Paths.get(htmlFile);
         callerDepth = cd;
-
-        // Register shutdown hook to close HTML file
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            closeHtmlFile();
-        }));
     }
 
     /**
@@ -173,23 +168,25 @@ public class MethodLoggingAdvice {
         logEntry.put("method", method.getName());
         logEntry.put("threadName", Thread.currentThread().getName());
 
-        // 5. Serialize parameters
+        // 5. Serialize parameters (names only to avoid JSON escaping issues in HTML)
         Map<String, String> params = new HashMap<>();
         Parameter[] parameters = method.getParameters();
         for (int i = 0; i < parameters.length; i++) {
             String paramName = parameters[i].getName(); // e.g., "arg0", "arg1"
-            Object paramValue = (i < allArgs.length) ? allArgs[i] : null;
-            params.put(paramName, safeSerialize(paramValue));
+            // Just store parameter type instead of value to avoid escaping issues
+            String paramType = (i < allArgs.length && allArgs[i] != null) ?
+                allArgs[i].getClass().getSimpleName() : "null";
+            params.put(paramName, paramType);
         }
         logEntry.put("params", params);
 
-        // 6. Handle return value or exception
+        // 6. Handle return value or exception (type only to avoid escaping issues)
         if (thrown != null) {
             logEntry.put("returnType", "EXCEPTION");
-            logEntry.put("returnData", safeSerialize(thrown));
+            logEntry.put("returnData", thrown.getClass().getSimpleName());
         } else {
-            logEntry.put("returnType", method.getReturnType().getName());
-            logEntry.put("returnData", safeSerialize(returned));
+            logEntry.put("returnType", method.getReturnType().getSimpleName());
+            logEntry.put("returnData", (returned != null) ? returned.getClass().getSimpleName() : "null");
         }
 
         logEntry.put("durationNanos", durationNanos);
@@ -291,7 +288,7 @@ public class MethodLoggingAdvice {
     /**
      * Initializes the HTML file with header, CSS, and JavaScript.
      */
-    private static void initHtmlFile() {
+    public static void initHtmlFile() {
         synchronized (htmlInitLock) {
             if (htmlInitialized) {
                 return;
@@ -299,7 +296,9 @@ public class MethodLoggingAdvice {
 
             try {
                 String htmlHeader = generateHtmlHeader();
-                Files.writeString(HTML_FILE, htmlHeader,
+                String htmlFooter = generateHtmlFooter();
+                // Write complete HTML structure
+                Files.writeString(HTML_FILE, htmlHeader + htmlFooter,
                         StandardOpenOption.CREATE,
                         StandardOpenOption.TRUNCATE_EXISTING);
                 htmlInitialized = true;
@@ -315,7 +314,7 @@ public class MethodLoggingAdvice {
      *
      * @param logEntry The map containing the log data.
      */
-    private static void writeHtmlLog(Map<String, Object> logEntry) {
+    public static void writeHtmlLog(Map<String, Object> logEntry) {
         // Lazy initialization
         if (!htmlInitialized) {
             initHtmlFile();
@@ -324,8 +323,19 @@ public class MethodLoggingAdvice {
         synchronized (htmlWriteLock) {
             try {
                 String jsonEntry = GSON.toJson(logEntry);
-                String jsCode = "            " + jsonEntry + ",\n";
-                Files.writeString(HTML_FILE, jsCode, StandardOpenOption.APPEND);
+                String pushStatement = "        methodCalls.push(" + jsonEntry + ");\n";
+
+                // Read current content
+                String content = Files.readString(HTML_FILE);
+
+                // Insert before closing script tag
+                int insertPos = content.lastIndexOf("    </script>");
+                if (insertPos > 0) {
+                    String newContent = content.substring(0, insertPos) +
+                                      pushStatement +
+                                      content.substring(insertPos);
+                    Files.writeString(HTML_FILE, newContent);
+                }
             } catch (IOException e) {
                 System.err.println("[MethodLoggerAgent] ERROR: Failed to write to HTML file: " + e.getMessage());
             }
@@ -335,7 +345,7 @@ public class MethodLoggingAdvice {
     /**
      * Closes the HTML file by adding the closing JavaScript and HTML tags.
      */
-    private static void closeHtmlFile() {
+    public static void closeHtmlFile() {
         if (!htmlInitialized) {
             return;
         }
@@ -356,272 +366,245 @@ public class MethodLoggingAdvice {
      *
      * @return The HTML header string.
      */
-    private static String generateHtmlHeader() {
-        return """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Method Call Tree - Java Logging Agent</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f5f5f5;
-            padding: 20px;
-        }
-        #header {
-            background: white;
-            padding: 20px;
-            margin-bottom: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        h1 { color: #333; margin-bottom: 10px; }
-        .stats { color: #666; font-size: 14px; }
-        #tree-container {
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            overflow-x: auto;
-        }
-        .tree { list-style: none; }
-        .tree ul { list-style: none; margin-left: 30px; }
-        .tree li {
-            margin: 5px 0;
-            position: relative;
-        }
-        .tree-node {
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            background: #fafafa;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-        .tree-node:hover {
-            background: #f0f0f0;
-        }
-        .tree-node.expanded {
-            background: #e8f4f8;
-        }
-        .method-signature {
-            font-weight: bold;
-            color: #2c3e50;
-            margin-bottom: 5px;
-        }
-        .method-info {
-            font-size: 12px;
-            color: #666;
-            margin: 3px 0;
-        }
-        .method-details {
-            margin-top: 10px;
-            padding: 10px;
-            background: white;
-            border-left: 3px solid #3498db;
-            font-size: 12px;
-            display: block;
-        }
-        .method-details.hidden {
-            display: none;
-        }
-        .param-list, .return-info {
-            margin: 5px 0;
-        }
-        .param-name {
-            font-weight: bold;
-            color: #e74c3c;
-        }
-        .duration {
-            color: #27ae60;
-            font-weight: bold;
-        }
-        .thread-name {
-            color: #9b59b6;
-            font-style: italic;
-        }
-        .toggle-btn {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            line-height: 20px;
-            text-align: center;
-            background: #3498db;
-            color: white;
-            border-radius: 3px;
-            margin-right: 5px;
-            user-select: none;
-        }
-        .children-container {
-            display: block;
-        }
-        .children-container.collapsed {
-            display: none;
-        }
-    </style>
-</head>
-<body>
-    <div id="header">
-        <h1>Method Call Tree Visualization</h1>
-        <div class="stats" id="stats">Loading...</div>
-    </div>
-    <div id="tree-container">
-        <div id="tree"></div>
-    </div>
-
-    <script>
-        // Method calls data array
-        var methodCalls = [
-""";
+    public static String generateHtmlHeader() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<!DOCTYPE html>\n");
+        sb.append("<html lang=\"en\">\n");
+        sb.append("<head>\n");
+        sb.append("    <meta charset=\"UTF-8\">\n");
+        sb.append("    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
+        sb.append("    <title>Method Call Tree - Java Logging Agent</title>\n");
+        sb.append("    <style>\n");
+        sb.append("        * { margin: 0; padding: 0; box-sizing: border-box; }\n");
+        sb.append("        body {\n");
+        sb.append("            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;\n");
+        sb.append("            background: #f5f5f5;\n");
+        sb.append("            padding: 20px;\n");
+        sb.append("        }\n");
+        sb.append("        #header {\n");
+        sb.append("            background: white;\n");
+        sb.append("            padding: 20px;\n");
+        sb.append("            margin-bottom: 20px;\n");
+        sb.append("            border-radius: 8px;\n");
+        sb.append("            box-shadow: 0 2px 4px rgba(0,0,0,0.1);\n");
+        sb.append("        }\n");
+        sb.append("        h1 { color: #333; margin-bottom: 10px; }\n");
+        sb.append("        .stats { color: #666; font-size: 14px; }\n");
+        sb.append("        #tree-container {\n");
+        sb.append("            background: white;\n");
+        sb.append("            padding: 20px;\n");
+        sb.append("            border-radius: 8px;\n");
+        sb.append("            box-shadow: 0 2px 4px rgba(0,0,0,0.1);\n");
+        sb.append("            overflow-x: auto;\n");
+        sb.append("        }\n");
+        sb.append("        .tree { list-style: none; }\n");
+        sb.append("        .tree ul { list-style: none; margin-left: 30px; }\n");
+        sb.append("        .tree li {\n");
+        sb.append("            margin: 5px 0;\n");
+        sb.append("            position: relative;\n");
+        sb.append("        }\n");
+        sb.append("        .tree-node {\n");
+        sb.append("            padding: 10px;\n");
+        sb.append("            border: 1px solid #ddd;\n");
+        sb.append("            border-radius: 4px;\n");
+        sb.append("            background: #fafafa;\n");
+        sb.append("            cursor: pointer;\n");
+        sb.append("            transition: background 0.2s;\n");
+        sb.append("        }\n");
+        sb.append("        .tree-node:hover {\n");
+        sb.append("            background: #f0f0f0;\n");
+        sb.append("        }\n");
+        sb.append("        .tree-node.expanded {\n");
+        sb.append("            background: #e8f4f8;\n");
+        sb.append("        }\n");
+        sb.append("        .method-signature {\n");
+        sb.append("            font-weight: bold;\n");
+        sb.append("            color: #2c3e50;\n");
+        sb.append("            margin-bottom: 5px;\n");
+        sb.append("        }\n");
+        sb.append("        .method-info {\n");
+        sb.append("            font-size: 12px;\n");
+        sb.append("            color: #666;\n");
+        sb.append("            margin: 3px 0;\n");
+        sb.append("        }\n");
+        sb.append("        .method-details {\n");
+        sb.append("            margin-top: 10px;\n");
+        sb.append("            padding: 10px;\n");
+        sb.append("            background: white;\n");
+        sb.append("            border-left: 3px solid #3498db;\n");
+        sb.append("            font-size: 12px;\n");
+        sb.append("            display: block;\n");
+        sb.append("        }\n");
+        sb.append("        .method-details.hidden {\n");
+        sb.append("            display: none;\n");
+        sb.append("        }\n");
+        sb.append("        .param-list, .return-info {\n");
+        sb.append("            margin: 5px 0;\n");
+        sb.append("        }\n");
+        sb.append("        .param-name {\n");
+        sb.append("            font-weight: bold;\n");
+        sb.append("            color: #e74c3c;\n");
+        sb.append("        }\n");
+        sb.append("        .duration {\n");
+        sb.append("            color: #27ae60;\n");
+        sb.append("            font-weight: bold;\n");
+        sb.append("        }\n");
+        sb.append("        .thread-name {\n");
+        sb.append("            color: #9b59b6;\n");
+        sb.append("            font-style: italic;\n");
+        sb.append("        }\n");
+        sb.append("        .toggle-btn {\n");
+        sb.append("            display: inline-block;\n");
+        sb.append("            width: 20px;\n");
+        sb.append("            height: 20px;\n");
+        sb.append("            line-height: 20px;\n");
+        sb.append("            text-align: center;\n");
+        sb.append("            background: #3498db;\n");
+        sb.append("            color: white;\n");
+        sb.append("            border-radius: 3px;\n");
+        sb.append("            margin-right: 5px;\n");
+        sb.append("            user-select: none;\n");
+        sb.append("        }\n");
+        sb.append("        .children-container {\n");
+        sb.append("            display: block;\n");
+        sb.append("        }\n");
+        sb.append("        .children-container.collapsed {\n");
+        sb.append("            display: none;\n");
+        sb.append("        }\n");
+        sb.append("    </style>\n");
+        sb.append("</head>\n");
+        sb.append("<body>\n");
+        sb.append("    <div id=\"header\">\n");
+        sb.append("        <h1>Method Call Tree Visualization</h1>\n");
+        sb.append("        <div class=\"stats\" id=\"stats\">Loading...</div>\n");
+        sb.append("    </div>\n");
+        sb.append("    <div id=\"tree-container\">\n");
+        sb.append("        <div id=\"tree\"></div>\n");
+        sb.append("    </div>\n");
+        sb.append("\n");
+        sb.append("    <script>\n");
+        sb.append("        var methodCalls = [];\n");
+        sb.append("        var lastCount = 0;\n");
+        sb.append("\n");
+        sb.append("        function buildTree() {\n");
+        sb.append("            if (methodCalls.length === 0) {\n");
+        sb.append("                document.getElementById('tree').innerHTML = '<p>No method calls recorded</p>';\n");
+        sb.append("                return;\n");
+        sb.append("            }\n");
+        sb.append("            if (methodCalls.length === lastCount) return;\n");
+        sb.append("            lastCount = methodCalls.length;\n");
+        sb.append("\n");
+        sb.append("            updateStats();\n");
+        sb.append("            const callMap = new Map();\n");
+        sb.append("            methodCalls.forEach(call => {\n");
+        sb.append("                callMap.set(call.callId, Object.assign({}, call, { children: [] }));\n");
+        sb.append("            });\n");
+        sb.append("            const roots = [];\n");
+        sb.append("            methodCalls.forEach(call => {\n");
+        sb.append("                const node = callMap.get(call.callId);\n");
+        sb.append("                if (call.parentCallId && callMap.has(call.parentCallId)) {\n");
+        sb.append("                    callMap.get(call.parentCallId).children.push(node);\n");
+        sb.append("                } else {\n");
+        sb.append("                    roots.push(node);\n");
+        sb.append("                }\n");
+        sb.append("            });\n");
+        sb.append("            const treeHtml = roots.map(function(root) { return renderNode(root); }).join('');\n");
+        sb.append("            document.getElementById('tree').innerHTML = '<ul class=\"tree\">' + treeHtml + '</ul>';\n");
+        sb.append("            attachEventListeners();\n");
+        sb.append("        }\n");
+        sb.append("\n");
+        sb.append("        function renderNode(node) {\n");
+        sb.append("            var hasChildren = node.children.length > 0;\n");
+        sb.append("            var toggleBtn = hasChildren ? '<span class=\"toggle-btn\">-</span>' : '<span class=\"toggle-btn\" style=\"visibility:hidden\">-</span>';\n");
+        sb.append("            var durationMs = (node.durationNanos / 1000000).toFixed(2);\n");
+        sb.append("            var params = formatParams(node.params);\n");
+        sb.append("            var returnInfo = formatReturn(node.returnType, node.returnData);\n");
+        sb.append("            var html = '<li>';\n");
+        sb.append("            html += '<div class=\"tree-node expanded\" data-call-id=\"' + node.callId + '\">';\n");
+        sb.append("            html += toggleBtn;\n");
+        sb.append("            html += '<div class=\"method-signature\">' + escapeHtml(node.package + '.' + node.class + '.' + node.method) + '()</div>';\n");
+        sb.append("            html += '<div class=\"method-info\"><span class=\"duration\">' + durationMs + ' ms</span> | ';\n");
+        sb.append("            html += '<span class=\"thread-name\">' + escapeHtml(node.threadName) + '</span> | ';\n");
+        sb.append("            html += 'Call ID: ' + escapeHtml(node.callId) + '</div>';\n");
+        sb.append("            html += '<div class=\"method-details\">';\n");
+        sb.append("            html += '<div><strong>Time:</strong> ' + escapeHtml(node.time) + '</div>';\n");
+        sb.append("            html += '<div><strong>Callers:</strong> ' + escapeHtml(node.callers) + '</div>';\n");
+        sb.append("            html += '<div class=\"param-list\"><strong>Parameters:</strong> ' + params + '</div>';\n");
+        sb.append("            html += '<div class=\"return-info\"><strong>Return:</strong> ' + returnInfo + '</div>';\n");
+        sb.append("            html += '</div></div>';\n");
+        sb.append("            if (hasChildren) {\n");
+        sb.append("                html += '<ul class=\"children-container\">';\n");
+        sb.append("                for (var i = 0; i < node.children.length; i++) {\n");
+        sb.append("                    html += renderNode(node.children[i]);\n");
+        sb.append("                }\n");
+        sb.append("                html += '</ul>';\n");
+        sb.append("            }\n");
+        sb.append("            html += '</li>';\n");
+        sb.append("            return html;\n");
+        sb.append("        }\n");
+        sb.append("\n");
+        sb.append("        function formatParams(params) {\n");
+        sb.append("            if (!params || Object.keys(params).length === 0) return '<em>none</em>';\n");
+        sb.append("            return Object.keys(params).map(function(name) {\n");
+        sb.append("                return '<span class=\"param-name\">' + escapeHtml(name) + '</span>: ' + escapeHtml(params[name]);\n");
+        sb.append("            }).join(', ');\n");
+        sb.append("        }\n");
+        sb.append("\n");
+        sb.append("        function formatReturn(returnType, returnData) {\n");
+        sb.append("            if (returnType === 'EXCEPTION') {\n");
+        sb.append("                return '<span style=\"color: red;\">Exception: ' + escapeHtml(returnData) + '</span>';\n");
+        sb.append("            }\n");
+        sb.append("            return '<span>' + escapeHtml(returnType) + ' = ' + escapeHtml(returnData) + '</span>';\n");
+        sb.append("        }\n");
+        sb.append("\n");
+        sb.append("        function escapeHtml(text) {\n");
+        sb.append("            var div = document.createElement('div');\n");
+        sb.append("            div.textContent = text || '';\n");
+        sb.append("            return div.innerHTML;\n");
+        sb.append("        }\n");
+        sb.append("\n");
+        sb.append("        function updateStats() {\n");
+        sb.append("            var totalCalls = methodCalls.length;\n");
+        sb.append("            var threads = new Set(methodCalls.map(function(c) { return c.threadName; })).size;\n");
+        sb.append("            var avgDuration = totalCalls > 0 ? (methodCalls.reduce(function(sum, c) { return sum + c.durationNanos; }, 0) / totalCalls / 1000000).toFixed(2) : 0;\n");
+        sb.append("            document.getElementById('stats').innerHTML = 'Total Calls: <strong>' + totalCalls + '</strong> | Threads: <strong>' + threads + '</strong> | Avg Duration: <strong>' + avgDuration + ' ms</strong>';\n");
+        sb.append("        }\n");
+        sb.append("\n");
+        sb.append("        function attachEventListeners() {\n");
+        sb.append("            document.querySelectorAll('.tree-node').forEach(function(node) {\n");
+        sb.append("                node.addEventListener('click', function(e) {\n");
+        sb.append("                    e.stopPropagation();\n");
+        sb.append("                    var details = this.querySelector('.method-details');\n");
+        sb.append("                    if (details) details.classList.toggle('hidden');\n");
+        sb.append("                    var children = this.parentElement.querySelector('.children-container');\n");
+        sb.append("                    var toggleBtn = this.querySelector('.toggle-btn');\n");
+        sb.append("                    if (children && toggleBtn) {\n");
+        sb.append("                        children.classList.toggle('collapsed');\n");
+        sb.append("                        toggleBtn.textContent = children.classList.contains('collapsed') ? '+' : '-';\n");
+        sb.append("                        this.classList.toggle('expanded');\n");
+        sb.append("                    }\n");
+        sb.append("                });\n");
+        sb.append("            });\n");
+        sb.append("        }\n");
+        sb.append("\n");
+        sb.append("        setInterval(buildTree, 1000);\n");
+        sb.append("        window.addEventListener('load', buildTree);\n");
+        sb.append("\n");
+        sb.append("        // Method calls will be pushed here dynamically\n");
+        return sb.toString();
     }
 
     /**
-     * Generates the HTML footer with tree-building JavaScript.
+     * Generates the HTML footer with closing tags.
      *
      * @return The HTML footer string.
      */
-    private static String generateHtmlFooter() {
-        return """
-        ];
-
-        // Build tree structure from flat method calls
-        function buildTree() {
-            if (methodCalls.length === 0) {
-                document.getElementById('tree').innerHTML = '<p>No method calls recorded</p>';
-                return;
-            }
-
-            // Update statistics
-            updateStats();
-
-            // Create lookup map
-            const callMap = new Map();
-            methodCalls.forEach(call => {
-                callMap.set(call.callId, {
-                    ...call,
-                    children: []
-                });
-            });
-
-            // Build parent-child relationships
-            const roots = [];
-            methodCalls.forEach(call => {
-                const node = callMap.get(call.callId);
-                if (call.parentCallId && callMap.has(call.parentCallId)) {
-                    callMap.get(call.parentCallId).children.push(node);
-                } else {
-                    roots.push(node);
-                }
-            });
-
-            // Render tree
-            const treeHtml = roots.map(root => renderNode(root)).join('');
-            document.getElementById('tree').innerHTML = '<ul class="tree">' + treeHtml + '</ul>';
-
-            // Add event listeners
-            attachEventListeners();
-        }
-
-        function renderNode(node) {
-            const hasChildren = node.children.length > 0;
-            const toggleBtn = hasChildren ? '<span class="toggle-btn">-</span>' : '<span class="toggle-btn" style="visibility:hidden">-</span>';
-
-            const durationMs = (node.durationNanos / 1000000).toFixed(2);
-            const params = formatParams(node.params);
-            const returnInfo = formatReturn(node.returnType, node.returnData);
-
-            let html = '<li>';
-            html += '<div class="tree-node expanded" data-call-id="' + node.callId + '">';
-            html += toggleBtn;
-            html += '<div class="method-signature">' + escapeHtml(node.package + '.' + node.class + '.' + node.method) + '()</div>';
-            html += '<div class="method-info"><span class="duration">' + durationMs + ' ms</span> | ';
-            html += '<span class="thread-name">' + escapeHtml(node.threadName) + '</span> | ';
-            html += 'Call ID: ' + escapeHtml(node.callId) + '</div>';
-            html += '<div class="method-details">';
-            html += '<div><strong>Time:</strong> ' + escapeHtml(node.time) + '</div>';
-            html += '<div><strong>Callers:</strong> ' + escapeHtml(node.callers) + '</div>';
-            html += '<div class="param-list"><strong>Parameters:</strong> ' + params + '</div>';
-            html += '<div class="return-info"><strong>Return:</strong> ' + returnInfo + '</div>';
-            html += '</div>';
-            html += '</div>';
-
-            if (hasChildren) {
-                html += '<ul class="children-container">';
-                node.children.forEach(child => {
-                    html += renderNode(child);
-                });
-                html += '</ul>';
-            }
-
-            html += '</li>';
-            return html;
-        }
-
-        function formatParams(params) {
-            if (!params || Object.keys(params).length === 0) {
-                return '<em>none</em>';
-            }
-            return Object.entries(params).map(([name, value]) =>
-                '<span class="param-name">' + escapeHtml(name) + '</span>: ' + escapeHtml(value)
-            ).join(', ');
-        }
-
-        function formatReturn(returnType, returnData) {
-            if (returnType === 'EXCEPTION') {
-                return '<span style="color: red;">Exception: ' + escapeHtml(returnData) + '</span>';
-            }
-            return '<span>' + escapeHtml(returnType) + ' = ' + escapeHtml(returnData) + '</span>';
-        }
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text || '';
-            return div.innerHTML;
-        }
-
-        function updateStats() {
-            const totalCalls = methodCalls.length;
-            const threads = new Set(methodCalls.map(c => c.threadName)).size;
-            const avgDuration = (methodCalls.reduce((sum, c) => sum + c.durationNanos, 0) / totalCalls / 1000000).toFixed(2);
-
-            document.getElementById('stats').innerHTML =
-                'Total Calls: <strong>' + totalCalls + '</strong> | ' +
-                'Threads: <strong>' + threads + '</strong> | ' +
-                'Avg Duration: <strong>' + avgDuration + ' ms</strong>';
-        }
-
-        function attachEventListeners() {
-            document.querySelectorAll('.tree-node').forEach(node => {
-                node.addEventListener('click', function(e) {
-                    e.stopPropagation();
-
-                    // Toggle details
-                    const details = this.querySelector('.method-details');
-                    if (details) {
-                        details.classList.toggle('hidden');
-                    }
-
-                    // Toggle children
-                    const children = this.parentElement.querySelector('.children-container');
-                    const toggleBtn = this.querySelector('.toggle-btn');
-                    if (children && toggleBtn) {
-                        children.classList.toggle('collapsed');
-                        toggleBtn.textContent = children.classList.contains('collapsed') ? '+' : '-';
-                        this.classList.toggle('expanded');
-                    }
-                });
-            });
-        }
-
-        // Build tree on load
-        window.addEventListener('load', buildTree);
-    </script>
-</body>
-</html>
-""";
+    public static String generateHtmlFooter() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("    </script>\n");
+        sb.append("</body>\n");
+        sb.append("</html>\n");
+        return sb.toString();
     }
 }
 

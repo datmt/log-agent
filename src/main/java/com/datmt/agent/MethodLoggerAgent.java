@@ -1,5 +1,7 @@
 package com.datmt.agent;
 
+import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.ClassFileVersion;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.matcher.ElementMatcher;
@@ -86,11 +88,18 @@ public class MethodLoggerAgent {
             }
 
             // --- Create method visibility matcher based on logLevel ---
-            ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription> methodMatcher = switch (logLevel.toUpperCase()) {
-                case "PUBLIC" -> ElementMatchers.isPublic();
-                case "PUBLIC_PROTECTED" -> ElementMatchers.isPublic().or(ElementMatchers.isProtected());
-                default -> ElementMatchers.any();
-            };
+            ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription> methodMatcher;
+            switch (logLevel.toUpperCase()) {
+                case "PUBLIC":
+                    methodMatcher = ElementMatchers.isPublic();
+                    break;
+                case "PUBLIC_PROTECTED":
+                    methodMatcher = ElementMatchers.isPublic().or(ElementMatchers.isProtected());
+                    break;
+                default:
+                    methodMatcher = ElementMatchers.any();
+                    break;
+            }
 
             // Exclude synthetic, bridge methods, and common noise methods
             methodMatcher = methodMatcher
@@ -104,11 +113,16 @@ public class MethodLoggerAgent {
 
             // Build the agent with error handling listener
             ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription> finalMethodMatcher = methodMatcher;
-            new AgentBuilder.Default()
+
+            // Create ByteBuddy instance with current JVM class file version
+            ByteBuddy byteBuddy = new ByteBuddy()
+                    .with(ClassFileVersion.ofThisVm());
+
+            new AgentBuilder.Default(byteBuddy)
                     .with(new AgentBuilder.Listener.StreamWriting(System.out).withTransformationsOnly())
                     .with(AgentBuilder.RedefinitionStrategy.RETRANSFORMATION)
                     .with(AgentBuilder.InitializationStrategy.NoOp.INSTANCE)
-                    .with(AgentBuilder.TypeStrategy.Default.REDEFINE)
+                    .disableClassFormatChanges()
                     .ignore(new AgentBuilder.RawMatcher.ForElementMatchers(
                             ElementMatchers.nameStartsWith("net.bytebuddy.")
                                     .or(ElementMatchers.isSynthetic())
@@ -178,7 +192,7 @@ public class MethodLoggerAgent {
      * @param logFile The log file path.
      * @throws IllegalArgumentException if the path is invalid or not writable.
      */
-    private static void validateLogFilePath(String logFile) {
+    public static void validateLogFilePath(String logFile) {
         if (logFile == null || logFile.trim().isEmpty()) {
             throw new IllegalArgumentException("Log file path cannot be null or empty");
         }
@@ -208,7 +222,7 @@ public class MethodLoggerAgent {
      * @param argName  The argument name (for error messages).
      * @throws IllegalArgumentException if any package name is invalid.
      */
-    private static void validatePackageNames(String[] packages, String argName) {
+    public static void validatePackageNames(String[] packages, String argName) {
         for (String pkg : packages) {
             String trimmed = pkg.trim();
             if (!trimmed.isEmpty() && !trimmed.matches("^[a-zA-Z0-9._]+$")) {
