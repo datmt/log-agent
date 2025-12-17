@@ -15,6 +15,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * This class contains the "advice" logic that will be woven into the target methods.
@@ -22,8 +23,27 @@ import java.util.*;
  */
 public class MethodLoggingAdvice {
 
-    // A thread-local stack to store method start times for nested calls
-    public static final ThreadLocal<Deque<Long>> startTimeStack = ThreadLocal.withInitial(LinkedList::new);
+    /**
+     * Context information for tracking method calls in a hierarchy.
+     */
+    static class CallContext {
+        final String callId;
+        final String parentCallId;
+        final int depth;
+        final long startTimeNanos;
+        final long threadId;
+
+        CallContext(String callId, String parentCallId, int depth, long startTimeNanos) {
+            this.callId = callId;
+            this.parentCallId = parentCallId;
+            this.depth = depth;
+            this.startTimeNanos = startTimeNanos;
+            this.threadId = Thread.currentThread().getId();
+        }
+    }
+
+    // A thread-local stack to store call context for nested calls
+    public static final ThreadLocal<Deque<CallContext>> callContextStack = ThreadLocal.withInitial(LinkedList::new);
 
     // Use a thread-safe, static Gson instance
     // Disabling HTML escaping prevents strings like "<" from becoming "\u003c"
@@ -33,15 +53,38 @@ public class MethodLoggingAdvice {
     public static Path LOG_FILE = Paths.get("method_calls.jsonl");
     public static Integer callerDepth = 1;
 
+    // HTML output file
+    public static Path HTML_FILE = Paths.get("method_calls.html");
+
+    // Sequential call ID generator
+    private static final AtomicLong callIdGenerator = new AtomicLong(0);
+
+    // Flag to track if HTML file has been initialized
+    private static volatile boolean htmlInitialized = false;
+
+    // Lock for HTML file initialization
+    private static final Object htmlInitLock = new Object();
+
+    // Lock for HTML file writing
+    private static final Object htmlWriteLock = new Object();
+
     /**
-     * Initializes the logger with the specified log file path.
+     * Initializes the logger with the specified log file path and HTML file path.
      * This is called by the agent's premain method.
      *
-     * @param logFile The path to the log file.
+     * @param logFile The path to the JSONL log file.
+     * @param htmlFile The path to the HTML output file.
+     * @param cd The caller depth.
      */
-    public static void init(String logFile, int cd) {
+    public static void init(String logFile, String htmlFile, int cd) {
         LOG_FILE = Paths.get(logFile);
+        HTML_FILE = Paths.get(htmlFile);
         callerDepth = cd;
+
+        // Register shutdown hook to close HTML file
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            closeHtmlFile();
+        }));
     }
 
     /**
@@ -55,17 +98,35 @@ public class MethodLoggingAdvice {
 
     /**
      * This method is executed "on method enter" (before the original method's code).
-     * It records the start time.
+     * It creates a call context with ID, parent ID, depth, and start time.
      */
     @Advice.OnMethodEnter
     public static void onEnter() {
-        // 1. Record the start time
-        startTimeStack.get().push(System.nanoTime());
+        Deque<CallContext> stack = callContextStack.get();
+
+        // Generate unique call ID
+        String callId = "CALL-" + callIdGenerator.incrementAndGet();
+
+        // Get parent call ID from stack (if exists)
+        String parentCallId = null;
+        if (!stack.isEmpty()) {
+            parentCallId = stack.peek().callId;
+        }
+
+        // Calculate depth
+        int depth = stack.size();
+
+        // Record start time
+        long startTime = System.nanoTime();
+
+        // Create and push context
+        CallContext context = new CallContext(callId, parentCallId, depth, startTime);
+        stack.push(context);
     }
 
     /**
      * This method is executed "on method exit" (after the original method's code).
-     * It logs everything to the JSON file.
+     * It logs everything to both the JSONL and HTML files.
      *
      * @param method   The method that was executed.
      * @param allArgs  All arguments passed to the method.
@@ -79,14 +140,28 @@ public class MethodLoggingAdvice {
             @Advice.Return(typing = Assigner.Typing.DYNAMIC) Object returned, // Handle void methods
             @Advice.Thrown Throwable thrown // Handle exceptions
     ) {
-        // 1. Calculate duration
-        long durationNanos = 0;
+        // 1. Pop context from stack
+        Deque<CallContext> stack = callContextStack.get();
+        if (stack.isEmpty()) {
+            // Should never happen, but handle gracefully
+            System.err.println("[MethodLoggerAgent] ERROR: Call stack is empty in onExit");
+            return;
+        }
 
-        // 2. Get the accurate caller by walking the stack trace
+        CallContext context = stack.pop();
+
+        // 2. Calculate duration (FIX THE BUG!)
+        long durationNanos = System.nanoTime() - context.startTimeNanos;
+
+        // 3. Get the accurate caller by walking the stack trace
         String callers = getCallerMethods(callerDepth);
 
-        // 3. Build the log entry
+        // 4. Build the log entry
         Map<String, Object> logEntry = new HashMap<>();
+        logEntry.put("callId", context.callId);
+        logEntry.put("parentCallId", context.parentCallId);
+        logEntry.put("depth", context.depth);
+        logEntry.put("threadId", context.threadId);
         logEntry.put("time", Instant.now().toString());
         logEntry.put("callers", callers);
 
@@ -98,7 +173,7 @@ public class MethodLoggingAdvice {
         logEntry.put("method", method.getName());
         logEntry.put("threadName", Thread.currentThread().getName());
 
-        // 4. Serialize parameters
+        // 5. Serialize parameters
         Map<String, String> params = new HashMap<>();
         Parameter[] parameters = method.getParameters();
         for (int i = 0; i < parameters.length; i++) {
@@ -108,7 +183,7 @@ public class MethodLoggingAdvice {
         }
         logEntry.put("params", params);
 
-        // 5. Handle return value or exception
+        // 6. Handle return value or exception
         if (thrown != null) {
             logEntry.put("returnType", "EXCEPTION");
             logEntry.put("returnData", safeSerialize(thrown));
@@ -119,8 +194,9 @@ public class MethodLoggingAdvice {
 
         logEntry.put("durationNanos", durationNanos);
 
-        // 6. Write the log entry to the file
+        // 7. Write to both JSONL and HTML files
         writeLog(logEntry);
+        writeHtmlLog(logEntry);
     }
 
     /**
@@ -210,6 +286,342 @@ public class MethodLoggingAdvice {
         } catch (IOException e) {
             System.err.println("[MethodLoggerAgent] ERROR: Failed to write to log file: " + e.getMessage());
         }
+    }
+
+    /**
+     * Initializes the HTML file with header, CSS, and JavaScript.
+     */
+    private static void initHtmlFile() {
+        synchronized (htmlInitLock) {
+            if (htmlInitialized) {
+                return;
+            }
+
+            try {
+                String htmlHeader = generateHtmlHeader();
+                Files.writeString(HTML_FILE, htmlHeader,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING);
+                htmlInitialized = true;
+                System.out.println("[MethodLoggerAgent] HTML file initialized: " + HTML_FILE);
+            } catch (IOException e) {
+                System.err.println("[MethodLoggerAgent] ERROR: Failed to initialize HTML file: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Appends a method call entry to the HTML file.
+     *
+     * @param logEntry The map containing the log data.
+     */
+    private static void writeHtmlLog(Map<String, Object> logEntry) {
+        // Lazy initialization
+        if (!htmlInitialized) {
+            initHtmlFile();
+        }
+
+        synchronized (htmlWriteLock) {
+            try {
+                String jsonEntry = GSON.toJson(logEntry);
+                String jsCode = "            " + jsonEntry + ",\n";
+                Files.writeString(HTML_FILE, jsCode, StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                System.err.println("[MethodLoggerAgent] ERROR: Failed to write to HTML file: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Closes the HTML file by adding the closing JavaScript and HTML tags.
+     */
+    private static void closeHtmlFile() {
+        if (!htmlInitialized) {
+            return;
+        }
+
+        synchronized (htmlWriteLock) {
+            try {
+                String htmlFooter = generateHtmlFooter();
+                Files.writeString(HTML_FILE, htmlFooter, StandardOpenOption.APPEND);
+                System.out.println("[MethodLoggerAgent] HTML file closed successfully");
+            } catch (IOException e) {
+                System.err.println("[MethodLoggerAgent] ERROR: Failed to close HTML file: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Generates the HTML header with CSS and JavaScript.
+     *
+     * @return The HTML header string.
+     */
+    private static String generateHtmlHeader() {
+        return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Method Call Tree - Java Logging Agent</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+        #header {
+            background: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 { color: #333; margin-bottom: 10px; }
+        .stats { color: #666; font-size: 14px; }
+        #tree-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow-x: auto;
+        }
+        .tree { list-style: none; }
+        .tree ul { list-style: none; margin-left: 30px; }
+        .tree li {
+            margin: 5px 0;
+            position: relative;
+        }
+        .tree-node {
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background: #fafafa;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .tree-node:hover {
+            background: #f0f0f0;
+        }
+        .tree-node.expanded {
+            background: #e8f4f8;
+        }
+        .method-signature {
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 5px;
+        }
+        .method-info {
+            font-size: 12px;
+            color: #666;
+            margin: 3px 0;
+        }
+        .method-details {
+            margin-top: 10px;
+            padding: 10px;
+            background: white;
+            border-left: 3px solid #3498db;
+            font-size: 12px;
+            display: block;
+        }
+        .method-details.hidden {
+            display: none;
+        }
+        .param-list, .return-info {
+            margin: 5px 0;
+        }
+        .param-name {
+            font-weight: bold;
+            color: #e74c3c;
+        }
+        .duration {
+            color: #27ae60;
+            font-weight: bold;
+        }
+        .thread-name {
+            color: #9b59b6;
+            font-style: italic;
+        }
+        .toggle-btn {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            line-height: 20px;
+            text-align: center;
+            background: #3498db;
+            color: white;
+            border-radius: 3px;
+            margin-right: 5px;
+            user-select: none;
+        }
+        .children-container {
+            display: block;
+        }
+        .children-container.collapsed {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <h1>Method Call Tree Visualization</h1>
+        <div class="stats" id="stats">Loading...</div>
+    </div>
+    <div id="tree-container">
+        <div id="tree"></div>
+    </div>
+
+    <script>
+        // Method calls data array
+        var methodCalls = [
+""";
+    }
+
+    /**
+     * Generates the HTML footer with tree-building JavaScript.
+     *
+     * @return The HTML footer string.
+     */
+    private static String generateHtmlFooter() {
+        return """
+        ];
+
+        // Build tree structure from flat method calls
+        function buildTree() {
+            if (methodCalls.length === 0) {
+                document.getElementById('tree').innerHTML = '<p>No method calls recorded</p>';
+                return;
+            }
+
+            // Update statistics
+            updateStats();
+
+            // Create lookup map
+            const callMap = new Map();
+            methodCalls.forEach(call => {
+                callMap.set(call.callId, {
+                    ...call,
+                    children: []
+                });
+            });
+
+            // Build parent-child relationships
+            const roots = [];
+            methodCalls.forEach(call => {
+                const node = callMap.get(call.callId);
+                if (call.parentCallId && callMap.has(call.parentCallId)) {
+                    callMap.get(call.parentCallId).children.push(node);
+                } else {
+                    roots.push(node);
+                }
+            });
+
+            // Render tree
+            const treeHtml = roots.map(root => renderNode(root)).join('');
+            document.getElementById('tree').innerHTML = '<ul class="tree">' + treeHtml + '</ul>';
+
+            // Add event listeners
+            attachEventListeners();
+        }
+
+        function renderNode(node) {
+            const hasChildren = node.children.length > 0;
+            const toggleBtn = hasChildren ? '<span class="toggle-btn">-</span>' : '<span class="toggle-btn" style="visibility:hidden">-</span>';
+
+            const durationMs = (node.durationNanos / 1000000).toFixed(2);
+            const params = formatParams(node.params);
+            const returnInfo = formatReturn(node.returnType, node.returnData);
+
+            let html = '<li>';
+            html += '<div class="tree-node expanded" data-call-id="' + node.callId + '">';
+            html += toggleBtn;
+            html += '<div class="method-signature">' + escapeHtml(node.package + '.' + node.class + '.' + node.method) + '()</div>';
+            html += '<div class="method-info"><span class="duration">' + durationMs + ' ms</span> | ';
+            html += '<span class="thread-name">' + escapeHtml(node.threadName) + '</span> | ';
+            html += 'Call ID: ' + escapeHtml(node.callId) + '</div>';
+            html += '<div class="method-details">';
+            html += '<div><strong>Time:</strong> ' + escapeHtml(node.time) + '</div>';
+            html += '<div><strong>Callers:</strong> ' + escapeHtml(node.callers) + '</div>';
+            html += '<div class="param-list"><strong>Parameters:</strong> ' + params + '</div>';
+            html += '<div class="return-info"><strong>Return:</strong> ' + returnInfo + '</div>';
+            html += '</div>';
+            html += '</div>';
+
+            if (hasChildren) {
+                html += '<ul class="children-container">';
+                node.children.forEach(child => {
+                    html += renderNode(child);
+                });
+                html += '</ul>';
+            }
+
+            html += '</li>';
+            return html;
+        }
+
+        function formatParams(params) {
+            if (!params || Object.keys(params).length === 0) {
+                return '<em>none</em>';
+            }
+            return Object.entries(params).map(([name, value]) =>
+                '<span class="param-name">' + escapeHtml(name) + '</span>: ' + escapeHtml(value)
+            ).join(', ');
+        }
+
+        function formatReturn(returnType, returnData) {
+            if (returnType === 'EXCEPTION') {
+                return '<span style="color: red;">Exception: ' + escapeHtml(returnData) + '</span>';
+            }
+            return '<span>' + escapeHtml(returnType) + ' = ' + escapeHtml(returnData) + '</span>';
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text || '';
+            return div.innerHTML;
+        }
+
+        function updateStats() {
+            const totalCalls = methodCalls.length;
+            const threads = new Set(methodCalls.map(c => c.threadName)).size;
+            const avgDuration = (methodCalls.reduce((sum, c) => sum + c.durationNanos, 0) / totalCalls / 1000000).toFixed(2);
+
+            document.getElementById('stats').innerHTML =
+                'Total Calls: <strong>' + totalCalls + '</strong> | ' +
+                'Threads: <strong>' + threads + '</strong> | ' +
+                'Avg Duration: <strong>' + avgDuration + ' ms</strong>';
+        }
+
+        function attachEventListeners() {
+            document.querySelectorAll('.tree-node').forEach(node => {
+                node.addEventListener('click', function(e) {
+                    e.stopPropagation();
+
+                    // Toggle details
+                    const details = this.querySelector('.method-details');
+                    if (details) {
+                        details.classList.toggle('hidden');
+                    }
+
+                    // Toggle children
+                    const children = this.parentElement.querySelector('.children-container');
+                    const toggleBtn = this.querySelector('.toggle-btn');
+                    if (children && toggleBtn) {
+                        children.classList.toggle('collapsed');
+                        toggleBtn.textContent = children.classList.contains('collapsed') ? '+' : '-';
+                        this.classList.toggle('expanded');
+                    }
+                });
+            });
+        }
+
+        // Build tree on load
+        window.addEventListener('load', buildTree);
+    </script>
+</body>
+</html>
+""";
     }
 }
 

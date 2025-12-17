@@ -29,6 +29,7 @@ public class MethodLoggerAgent {
 
             Map<String, String> argsMap = parseAgentArgs(agentArgs);
             String logFile = argsMap.getOrDefault("logfile", "method_calls.jsonl");
+            String htmlFile = argsMap.getOrDefault("htmlfile", "method_calls.html");
             String packages = argsMap.getOrDefault("packages", null);
             String excludePackages = argsMap.getOrDefault("excludePackages", null);
             Integer callerDepth = Helpers.fromString(argsMap.getOrDefault("callerDepth", "1"), 1);
@@ -37,9 +38,10 @@ public class MethodLoggerAgent {
             // Validate log file path
             validateLogFilePath(logFile);
 
-            // Initialize the advice class with the log file path (must be done before any instrumentation)
-            MethodLoggingAdvice.init(logFile, callerDepth);
-            System.out.println("[MethodLoggerAgent] Logging to: " + MethodLoggingAdvice.getLogFile());
+            // Initialize the advice class with the log file path and HTML file path (must be done before any instrumentation)
+            MethodLoggingAdvice.init(logFile, htmlFile, callerDepth);
+            System.out.println("[MethodLoggerAgent] Logging to JSONL: " + MethodLoggingAdvice.getLogFile());
+            System.out.println("[MethodLoggerAgent] Logging to HTML: " + MethodLoggingAdvice.HTML_FILE);
             System.out.println("[MethodLoggerAgent] Log level: " + logLevel);
 
             // --- Create the INCLUSION package matcher ---
